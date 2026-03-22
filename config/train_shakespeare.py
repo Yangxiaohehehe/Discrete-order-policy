@@ -13,7 +13,7 @@ wandb_log = True
 wandb_project = 'ao-gpt-experiments' # 你的项目名称
 wandb_run_name = 'mdm_random_order_run1' # 你的实验运行名称
 
-dataset = 'shakespeare_char'
+dataset = 'shakespeare'
 gradient_accumulation_steps = 1
 batch_size = 64
 block_size = 256 # context of up to 256 previous characters

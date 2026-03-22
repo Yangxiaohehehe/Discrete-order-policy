@@ -28,7 +28,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
+from AOGPT import AOGPTConfig, AOGPT
 
+os.environ["WANDB_API_KEY"] = "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"
+os.environ["WANDB_MODE"] = "online"
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
@@ -40,9 +43,9 @@ eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = False # disabled by default
-wandb_project = 'owt'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
+wandb_log = True 
+wandb_project = 'ao-gpt-experiments' # 你的项目名称
+wandb_run_name = 'mdm_random_order_run1' # 你的实验运行名称
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
@@ -144,8 +147,9 @@ if os.path.exists(meta_path):
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+#model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
+#                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size, bias=bias, vocab_size=None, dropout=dropout)
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -153,8 +157,10 @@ if init_from == 'scratch':
     if meta_vocab_size is None:
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    # gptconf = GPTConfig(**model_args)
+    # model = GPT(gptconf)
+    aogptconf = AOGPTConfig(**model_args)
+    model = AOGPT(aogptconf)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
@@ -166,8 +172,10 @@ elif init_from == 'resume':
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
     # create the model
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    # gptconf = GPTConfig(**model_args)
+    # model = GPT(gptconf)
+    aogptconf = AOGPTConfig(**model_args)
+    model = AOGPT(aogptconf)
     state_dict = checkpoint['model']
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more
@@ -178,14 +186,14 @@ elif init_from == 'resume':
     model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
-elif init_from.startswith('gpt2'):
-    print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
-    # initialize from OpenAI GPT-2 weights
-    override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
-    # read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = getattr(model.config, k)
+# elif init_from.startswith('gpt2'):
+#     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
+#     # initialize from OpenAI GPT-2 weights
+#     override_args = dict(dropout=dropout)
+#     model = GPT.from_pretrained(init_from, override_args)
+#     # read off the created config params, so we can store them into checkpoint correctly
+#     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+#         model_args[k] = getattr(model.config, k)
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
@@ -217,13 +225,27 @@ def estimate_loss():
     out = {}
     model.eval()
     for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
+        # 我们现在要分别记录 Random 和 L2R 的 loss
+        losses_random = torch.zeros(eval_iters)
+        losses_l2r = torch.zeros(eval_iters)
+        
         for k in range(eval_iters):
-            X, Y = get_batch(split)
+            X, _ = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
+                # 1. 测算 Random 模式下的 Loss
+                _, loss_rand = model(X, mode='Random')
+                
+                # 2. 测算正常从左到右的 Loss
+                # ⚠️ 注意：这里传入的 mode 字符串取决于你的 AOGPT.py 内部是怎么命名的
+                # 常见的可能是 'l2r', 'AR', 或者 'Sequential'，请确认你代码里的名字！
+                _, loss_ar = model(X, mode='AR') 
+                
+            losses_random[k] = loss_rand.item()
+            losses_l2r[k] = loss_ar.item()
+            
+        out[f'{split}_random'] = losses_random.mean()
+        out[f'{split}_l2r'] = losses_l2r.mean()
+    model.eval() # 恢复成 train() 之前，保持严谨
     model.train()
     return out
 
@@ -262,17 +284,24 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print(f"step {iter_num}:")
+        print(f"  -> Random Loss | train: {losses['train_random']:.4f}, val: {losses['val_random']:.4f}")
+        print(f"  -> L2R    Loss | train: {losses['train_l2r']:.4f}, val: {losses['val_l2r']:.4f}")
+        
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
+                "train/loss_random": losses['train_random'],
+                "val/loss_random": losses['val_random'],
+                "train/loss_l2r": losses['train_l2r'],   # 增加 L2R 的记录
+                "val/loss_l2r": losses['val_l2r'],       # 增加 L2R 的记录
                 "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
+                "mfu": running_mfu*100,
             })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
+            
+        # 保存最佳模型时，我们依然以 Random 模式的 validation loss 为准
+        if losses['val_random'] < best_val_loss or always_save_checkpoint:
+            best_val_loss = losses['val_random']
             if iter_num > 0:
                 checkpoint = {
                     'model': raw_model.state_dict(),
@@ -280,7 +309,7 @@ while True:
                     'model_args': model_args,
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
-                    'config': config,
+                    'config': aogptconf, # 这里假设你之前已经把 config 改名为了 aogptconf
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
@@ -297,7 +326,9 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
+            #logits, loss = model(X, Y)
+            logits, loss = model(X, mode='Random')
+            #logits, loss = model(X, mode='Random_CL', random_ratio=0.5)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
