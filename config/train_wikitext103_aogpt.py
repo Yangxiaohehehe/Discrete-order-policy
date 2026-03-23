@@ -10,15 +10,18 @@ log_interval = 50
 wandb_log = True
 wandb_project = 'ao-gpt-experiments-256'
 #wandb_run_name = 'R_w103-loss-R-data-l2r-small_block-nodrop'
-wandb_run_name = 'R-data-l2r-loss-Ran'
+wandb_run_name = 'R-data-l2r-loss-AR'
 
 # 数据集设定
 dataset = 'wikitext103'
 batch_size = 32
 block_size = 256 # 上下文长度依然保持 256 个 BPE Token
 gradient_accumulation_steps = 4 # 累加梯度，模拟 32 * 4 = 128 的全局 Batch Size，让 Loss 更平滑
-
+permute_data = False
 # 模型规模 (Baby GPT)
+model_type = 'aogpt'
+aogpt_train_mode = 'Random'
+eval_modes = ['Random'] # 单评估
 n_layer = 2
 n_head = 4
 n_embd = 128
