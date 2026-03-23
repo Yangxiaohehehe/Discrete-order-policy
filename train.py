@@ -24,6 +24,7 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
@@ -55,8 +56,9 @@ batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch si
 block_size = 1024
 # model
 model_type = 'aogpt'          # 可选: 'gpt' (原生 NanoGPT) 或 'aogpt' (AO-GPT)
-aogpt_train_mode = 'AR' # 仅在 model_type == 'aogpt' 时生效, 可选: 'random', 'ar' 等
-eval_modes = ['Random']    # 评估模式列表。对于AOGPT，可以传 ['random'] (单loss) 或 ['random', 'ar'] (双loss)
+aogpt_train_mode = 'AR' # 仅在 model_type == 'aogpt' 时生效
+main_eval_mode = 'Random' # AOGPT 主评估模式
+generalization_eval_mode = '' # 额外泛化评估模式；例如 Random 训练时可设为 'AR'
 n_layer = 12
 n_head = 12
 n_embd = 768
@@ -80,10 +82,15 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
+val_token_loss_log = True
+val_token_loss_batch_size = 8
+val_token_loss_seed = 12345
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
+config['main_eval_mode'] = main_eval_mode
+config['generalization_eval_mode'] = generalization_eval_mode
 # -----------------------------------------------------------------------------
 
 # various inits, derived attributes, I/O setup
@@ -121,6 +128,7 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 np.random.seed(permute_seed)
 fixed_perm = torch.tensor(np.random.permutation(block_size), dtype=torch.long) if permute_data else None
+fixed_val_batch_size = min(val_token_loss_batch_size, batch_size)
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
@@ -144,6 +152,29 @@ def get_batch(split):
         x = x[:, perm_idx]
         y = y[:, perm_idx]
     return x, y
+
+def get_fixed_batch(split, fixed_batch_size, fixed_seed):
+    if split == 'train':
+        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+    else:
+        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+    rng = np.random.default_rng(fixed_seed)
+    ix = rng.integers(0, len(data) - block_size, size=fixed_batch_size)
+    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    if device_type == 'cuda':
+        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+    else:
+        x, y = x.to(device), y.to(device)
+    if permute_data:
+        perm_idx = fixed_perm.to(device)
+        x = x[:, perm_idx]
+        y = y[:, perm_idx]
+    return x, y
+
+fixed_val_x, fixed_val_y = get_fixed_batch('val', fixed_val_batch_size, val_token_loss_seed)
+val_token_loss_history = []
+val_token_loss_steps = []
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -249,27 +280,71 @@ def estimate_loss():
                 losses[k] = loss.item()
             out[split] = losses.mean().item()
         elif model_type == 'aogpt':
-            if len(eval_modes) == 1:
-                losses = torch.zeros(eval_iters)
-                emode = eval_modes[0]
-                for k in range(eval_iters):
-                    X, Y = get_batch(split)
-                    with ctx:
-                        logits, loss = model(X, mode=emode)
-                    losses[k] = loss.item()
-                out[split] = losses.mean().item()
-            else:
-                losses_by_mode = {emode: torch.zeros(eval_iters) for emode in eval_modes}
-                for k in range(eval_iters):
-                    X, Y = get_batch(split)
-                    with ctx:
-                        for emode in eval_modes:
-                            logits, loss = model(X, mode=emode)
-                            losses_by_mode[emode][k] = loss.item()
-                for emode in eval_modes:
-                    out[f"{split}_{emode}"] = losses_by_mode[emode].mean().item()
+            losses = torch.zeros(eval_iters)
+            if generalization_eval_mode:
+                generalization_losses = torch.zeros(eval_iters)
+            for k in range(eval_iters):
+                X, Y = get_batch(split)
+                with ctx:
+                    logits, loss = model(X, mode=main_eval_mode)
+                    if generalization_eval_mode:
+                        _, generalization_loss = model(X, mode=generalization_eval_mode)
+                losses[k] = loss.item()
+                if generalization_eval_mode:
+                    generalization_losses[k] = generalization_loss.item()
+            out[split] = losses.mean().item()
+            if generalization_eval_mode:
+                metric_suffix = generalization_eval_mode.lower()
+                out[f"{split}_generalization_{metric_suffix}"] = generalization_losses.mean().item()
     model.train()
     return out
+
+@torch.no_grad()
+def estimate_fixed_val_token_loss():
+    model.eval()
+    with ctx:
+        if model_type == 'gpt':
+            logits, _ = model(fixed_val_x, fixed_val_y)
+            token_losses = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                fixed_val_y.view(-1),
+                ignore_index=-1,
+                reduction='none',
+            ).view(fixed_val_y.size(0), fixed_val_y.size(1))
+        else:
+            # For Random training we visualize only AR-mode validation behavior.
+            logits, _ = model(fixed_val_x, mode='AR')
+            token_losses = F.cross_entropy(
+                logits[:, :-1, :].reshape(-1, logits.size(-1)),
+                fixed_val_x.reshape(-1),
+                ignore_index=-1,
+                reduction='none',
+            ).view(fixed_val_x.size(0), fixed_val_x.size(1))
+    model.train()
+    return token_losses.mean(dim=0).float().cpu().numpy()
+
+def build_val_token_loss_figure(history, steps):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    history_np = np.asarray(history, dtype=np.float32)
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8), constrained_layout=True)
+
+    axes[0].plot(np.arange(history_np.shape[1]), history_np[-1], linewidth=1.5)
+    axes[0].set_title('Fixed Val Batch Mean Per-Token Loss')
+    axes[0].set_xlabel('Token Position')
+    axes[0].set_ylabel('Loss')
+
+    im = axes[1].imshow(history_np, aspect='auto', origin='lower', interpolation='nearest')
+    axes[1].set_title('Per-Token Loss Over Eval Steps')
+    axes[1].set_xlabel('Token Position')
+    axes[1].set_ylabel('Eval Step')
+    axes[1].set_yticks(np.arange(len(steps)))
+    axes[1].set_yticklabels([str(step) for step in steps])
+    fig.colorbar(im, ax=axes[1], fraction=0.025, pad=0.02, label='Loss')
+
+    return fig
 
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
@@ -306,35 +381,38 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        if model_type == 'aogpt' and len(eval_modes) > 1:
-            # 双 Loss 打印逻辑
-            m1, m2 = eval_modes[0], eval_modes[1]
-            print(f"step {iter_num}: train_loss_{m1} {losses.get(f'train_{m1}', 0):.4f}, val_loss_{m1} {losses.get(f'val_{m1}', 0):.4f} | "
-                  f"train_loss_{m2} {losses.get(f'train_{m2}', 0):.4f}, val_loss_{m2} {losses.get(f'val_{m2}', 0):.4f}")
-            if wandb_log:
-                wandb.log({
-                    "iter": iter_num,
-                    f"train/loss_{m1}": losses.get(f'train_{m1}', 0),
-                    f"val/loss_{m1}": losses.get(f'val_{m1}', 0),
-                    f"train/loss_{m2}": losses.get(f'train_{m2}', 0),
-                    f"val/loss_{m2}": losses.get(f'val_{m2}', 0),
-                    "lr": lr,
-                    "mfu": running_mfu*100,
-                })
-            # 决定保存权重的关键 metric：默认取列表里第一个模式的 val loss
-            val_loss_for_ckpt = losses.get(f'val_{m1}', 0)
-        else:
-            # 单 Loss 打印逻辑
-            print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-            if wandb_log:
-                wandb.log({
-                    "iter": iter_num,
-                    "train/loss": losses['train'],
-                    "val/loss": losses['val'],
-                    "lr": lr,
-                    "mfu": running_mfu*100,
-                })
-            val_loss_for_ckpt = losses['val']
+        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        if model_type == 'aogpt' and generalization_eval_mode:
+            generalization_key = generalization_eval_mode.lower()
+            print(
+                f"  generalization_{generalization_key}_loss: "
+                f"train {losses[f'train_generalization_{generalization_key}']:.4f}, "
+                f"val {losses[f'val_generalization_{generalization_key}']:.4f}"
+            )
+        if wandb_log:
+            log_payload = {
+                "iter": iter_num,
+                "train/loss": losses['train'],
+                "val/loss": losses['val'],
+                "lr": lr,
+                "mfu": running_mfu*100,
+            }
+            if model_type == 'aogpt' and generalization_eval_mode:
+                generalization_key = generalization_eval_mode.lower()
+                log_payload[f"train/generalization_{generalization_key}_loss"] = losses[f"train_generalization_{generalization_key}"]
+                log_payload[f"val/generalization_{generalization_key}_loss"] = losses[f"val_generalization_{generalization_key}"]
+            if val_token_loss_log:
+                token_loss_curve = estimate_fixed_val_token_loss()
+                val_token_loss_history.append(token_loss_curve)
+                val_token_loss_steps.append(iter_num)
+                figure = build_val_token_loss_figure(val_token_loss_history, val_token_loss_steps)
+                metric_prefix = "val/generalization_ar" if model_type == 'aogpt' and aogpt_train_mode == 'Random' else "val/main"
+                log_payload[f"{metric_prefix}_fixed_batch_token_loss_mean"] = float(token_loss_curve.mean())
+                log_payload[f"{metric_prefix}_fixed_batch_token_loss_plot"] = wandb.Image(figure)
+                import matplotlib.pyplot as plt
+                plt.close(figure)
+            wandb.log(log_payload)
+        val_loss_for_ckpt = losses['val']
         if val_loss_for_ckpt < best_val_loss or always_save_checkpoint:
             best_val_loss = val_loss_for_ckpt
             if iter_num > 0:
